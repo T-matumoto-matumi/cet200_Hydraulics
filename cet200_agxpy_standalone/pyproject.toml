@@ -12,7 +12,9 @@ license = { text = "Apache-2.0" }
 authors = [
   {name = "VMC Motion Technologies Co., Ltd.", email = "support@vmc-motion.com"},
 ]
-dependencies = []
+dependencies = [
+  "matplotlib>=3.5",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

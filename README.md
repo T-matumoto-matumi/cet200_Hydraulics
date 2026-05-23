@@ -78,11 +78,20 @@ cd cet200
 python -m venv .venv
 .venv\Scripts\activate
 
+# uvでセットアップ
+uv venv --python 3.10 .venv
+. .venv/bin/activate
+
 # cet200_agxpy_standalone pythonパッケージのeditableインストール
 cd cet200_agxpy_standalone
 python -m pip install -r requirements.txt
 python -m pip show cet200_agxpy_standalone
 
+# ubuntu22.04
+cd cet200_agxpy_standalone
+uv pip install -r requirements.txt
+uv pip show cet200_agxpy_standalone
+cd
 # プログラムの実行
 cd src/cet200_agxpy_standalone/apps
 python cet200_on_terrain.py
