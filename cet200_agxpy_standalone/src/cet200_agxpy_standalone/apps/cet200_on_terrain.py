@@ -20,7 +20,7 @@ from cet200_agxpy_standalone import (
     cet200,
     excavator_monitor,
     #excavator_keyboard_gamepad_with_hydraulics as excavator_keyboard_gamepad,
-    excavator_keyboard_gamepad_with_hydraulics_all as excavator_keyboard_gamepad,
+    excavator_keyboard_gamepad_with_hydraulics_arm as excavator_keyboard_gamepad,
 
 )
 

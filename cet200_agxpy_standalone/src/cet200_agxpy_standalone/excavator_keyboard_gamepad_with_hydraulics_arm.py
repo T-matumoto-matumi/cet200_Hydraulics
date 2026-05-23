@@ -8,6 +8,7 @@ import agxHydraulics
 import agxPowerLine
 
 from agxPythonModules.utils.callbacks import (
+    StepEventCallback,
     KeyboardCallback as Input,
     GamepadCallback as Gamepad,
 )
@@ -38,7 +39,7 @@ class CollectorParams:
     # データ収集設定
     input_change_period: float = 0.5  # レバー入力変更周期 [s]
     simulation_time: float = 3600  # シミュレーション時間 [s]
-    valve_transition_time: float = 0.05  # 弁開閉の遷移時間 [s]
+
     
     time_step: float = 1 / 10000
     ramp_up_time: float = 0.1
@@ -92,6 +93,8 @@ class FourWayThreePositionSpoolValve:
 class HydraulisCircuit:
     def __init__(self,joint: agx.Prismatic,sim: agxSDK.Simulation,params:CollectorParams):
         self.params = params
+        self.joint = joint
+        self.lever_input = 0.0
         OUTPUT = agxPowerLine.OUTPUT
         INPUT = agxPowerLine.INPUT
         pipe_area = agxHydraulics.diameterToArea(params.pipe_diameter)
@@ -124,6 +127,19 @@ class HydraulisCircuit:
             agxHydraulics.diameterToArea(params.relief_diameter)
         )
 
+        self.makeup_check_valve_a = agxHydraulics.CheckValve(
+            params.pipe_length,
+            pipe_area,
+            params.fluid_density,
+            agxHydraulics.CheckValve.FORWARD,
+        )
+        self.makeup_check_valve_b = agxHydraulics.CheckValve(
+            params.pipe_length,
+            pipe_area,
+            params.fluid_density,
+            agxHydraulics.CheckValve.FORWARD,
+        )
+
         self.piston = agxHydraulics.PistonActuator(
             joint, barrel_area, piston_area, params.fluid_density
         )
@@ -140,7 +156,29 @@ class HydraulisCircuit:
         self.relief_valve.connect(self.p_1)
         self.p_2.connect(self.piston)
         self.piston.connect(OUTPUT,OUTPUT,self.p_3)
+        self._setup_makeup_check_valves()
         self._setup_connection(sim)
+
+    def _setup_makeup_check_valves(self):
+        """タンクからシリンダA/Bラインへ補油するチェック弁を接続する。"""
+        a_connector = self.p_2.getOutputFlowConnector()
+        b_connector = self.p_3.getOutputFlowConnector()
+
+        assert a_connector is not None, "AラインのFlowConnectorがありません"
+        assert b_connector is not None, "BラインのFlowConnectorがありません"
+
+        connected_a = a_connector.connect(
+            agxPowerLine.INPUT,
+            agxPowerLine.OUTPUT,
+            self.makeup_check_valve_a,
+        )
+        connected_b = b_connector.connect(
+            agxPowerLine.INPUT,
+            agxPowerLine.OUTPUT,
+            self.makeup_check_valve_b,
+        )
+        assert connected_a, "Aラインのメイクアップチェック弁接続に失敗しました"
+        assert connected_b, "Bラインのメイクアップチェック弁接続に失敗しました"
 
     def _ensure_joint_range(self, joint: agx.Prismatic):
         range_1d = joint.getRange1D()
@@ -163,6 +201,7 @@ class HydraulisCircuit:
         self.powerline.add(self.pump)
     
     def control_input(self,u):
+        self.lever_input = u
         if abs(u) <= 0.0:
             self.pump.setTargetFlowRate(0.0)
             self.spool.linkNone()
@@ -174,6 +213,108 @@ class HydraulisCircuit:
             self.spool.linkParallel()   # 伸び
         else:
             self.spool.linkCross()      # 縮み
+
+    def get_cylinder_displacement(self):
+        return self.piston.getPistonPosition()
+
+    def get_input_pressure(self):
+        return self.piston.getInputChamber().getInputPressure()
+
+    def get_output_pressure(self):
+        return self.piston.getOutputChamber().getInputPressure()
+
+
+class HydraulicPlotter:
+    """油圧レバー入力、シリンダ変位、IN/OUT圧のライブプロット。"""
+
+    def __init__(self, circuit: HydraulisCircuit, update_every_steps=10, max_samples=2000):
+        self.circuit = circuit
+        self.update_every_steps = update_every_steps
+        self.max_samples = max_samples
+        self.step_count = 0
+        self.times = []
+        self.lever_inputs = []
+        self.displacements = []
+        self.input_pressures = []
+        self.output_pressures = []
+        self.enabled = False
+
+        try:
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            print(f"WARNING: Hydraulic plot deactivated. matplotlib import failed: {exc}")
+            return
+
+        self.plt = plt
+        self.plt.ion()
+        self.fig, (self.ax_input, self.ax_displacement, self.ax_pressure) = self.plt.subplots(
+            3, 1, sharex=True, num="Arm hydraulic monitor"
+        )
+        self.fig.tight_layout()
+
+        self.line_input, = self.ax_input.plot([], [], label="lever")
+        self.line_displacement, = self.ax_displacement.plot([], [], label="cylinder displacement")
+        self.line_pressure_in, = self.ax_pressure.plot([], [], label="IN pressure")
+        self.line_pressure_out, = self.ax_pressure.plot([], [], label="OUT pressure")
+
+        self.ax_input.set_ylabel("Lever [-]")
+        self.ax_input.set_ylim(-1.05, 1.05)
+        self.ax_input.grid(True)
+
+        self.ax_displacement.set_ylabel("Disp. [m]")
+        self.ax_displacement.grid(True)
+
+        self.ax_pressure.set_ylabel("Pressure [MPa]")
+        self.ax_pressure.set_xlabel("Time [s]")
+        self.ax_pressure.grid(True)
+        self.ax_pressure.legend(loc="upper right")
+
+        self.enabled = True
+
+    def sample(self):
+        if not self.enabled:
+            return
+
+        self.step_count += 1
+        self.times.append(simulation().getTimeStamp())
+        self.lever_inputs.append(self.circuit.lever_input)
+        self.displacements.append(self.circuit.get_cylinder_displacement())
+        self.input_pressures.append(self.circuit.get_input_pressure() * 1e-6)
+        self.output_pressures.append(self.circuit.get_output_pressure() * 1e-6)
+
+        if len(self.times) > self.max_samples:
+            self.times = self.times[-self.max_samples:]
+            self.lever_inputs = self.lever_inputs[-self.max_samples:]
+            self.displacements = self.displacements[-self.max_samples:]
+            self.input_pressures = self.input_pressures[-self.max_samples:]
+            self.output_pressures = self.output_pressures[-self.max_samples:]
+
+        if self.step_count % self.update_every_steps != 0:
+            return
+
+        self.line_input.set_data(self.times, self.lever_inputs)
+        self.line_displacement.set_data(self.times, self.displacements)
+        self.line_pressure_in.set_data(self.times, self.input_pressures)
+        self.line_pressure_out.set_data(self.times, self.output_pressures)
+
+        for ax in [self.ax_input, self.ax_displacement, self.ax_pressure]:
+            ax.relim()
+            ax.autoscale_view()
+
+        self.ax_input.set_ylim(-1.05, 1.05)
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+        self.plt.pause(0.001)
+
+
+def setup_hydraulic_plotter(circuit: HydraulisCircuit):
+    plotter = HydraulicPlotter(circuit)
+
+    def update_plot(_time_stamp):
+        plotter.sample()
+
+    StepEventCallback.postCallback(update_plot)
+    return plotter
 
 
 # 各関節に与える最大速度。
@@ -423,6 +564,7 @@ def setup_keyboard_gamepad_speed_control(excavator: agxSDK.Assembly):
         joint.getMotor1D().setEnable(True)
 
     arm_hydraulic_circuit = HydraulisCircuit(arm_joint.asPrismatic(), simulation(), CollectorParams())
+    setup_hydraulic_plotter(arm_hydraulic_circuit)
 
     # 入力デバイスごとのイベント設定を登録する。
     _setup_keyboard(excavator, arm_hydraulic_circuit)
